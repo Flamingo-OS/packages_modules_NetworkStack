@@ -1961,6 +1961,9 @@ public class IpClient extends StateMachine {
             if (mDhcpClient == null) {
                 // There's no DHCPv4 for which to wait; proceed to stopped.
                 deferMessage(obtainMessage(CMD_JUMP_STOPPING_TO_STOPPED));
+            } else {
+                mDhcpClient.sendMessage(DhcpClient.CMD_STOP_DHCP);
+                mDhcpClient.doQuit();
             }
 
             // Restore the interface MTU to initial value if it has changed.
@@ -2264,11 +2267,6 @@ public class IpClient extends StateMachine {
             if (mIpReachabilityMonitor != null) {
                 mIpReachabilityMonitor.stop();
                 mIpReachabilityMonitor = null;
-            }
-
-            if (mDhcpClient != null) {
-                mDhcpClient.sendMessage(DhcpClient.CMD_STOP_DHCP);
-                mDhcpClient.doQuit();
             }
 
             if (mPacketTracker != null) {
