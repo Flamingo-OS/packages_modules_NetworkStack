@@ -25,11 +25,14 @@ import static android.net.INetworkMonitor.NETWORK_VALIDATION_PROBE_HTTP;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_PROBE_HTTPS;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_PROBE_PRIVDNS;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_RESULT_PARTIAL;
+import static android.net.INetworkMonitor.NETWORK_VALIDATION_RESULT_SKIPPED;
 import static android.net.INetworkMonitor.NETWORK_VALIDATION_RESULT_VALID;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VCN_MANAGED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_OEM_PAID;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_TRUSTED;
 import static android.net.NetworkCapabilities.TRANSPORT_CELLULAR;
 import static android.net.NetworkCapabilities.TRANSPORT_VPN;
 import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
@@ -115,7 +118,6 @@ import android.net.NetworkTestResultParcelable;
 import android.net.Uri;
 import android.net.captiveportal.CaptivePortalProbeResult;
 import android.net.metrics.IpConnectivityLog;
-import android.net.shared.NetworkMonitorUtils;
 import android.net.shared.PrivateDnsConfig;
 import android.net.util.SharedLog;
 import android.net.wifi.WifiInfo;
@@ -1793,11 +1795,46 @@ public class NetworkMonitorTest {
         runFailedNetworkTest();
     }
 
+    private void doValidationSkippedTest(NetworkCapabilities nc) throws Exception {
+        // For S+, the RESULT_SKIPPED bit will be included on networks that both do not require
+        // validation and for which validation is not performed.
+        final int validationResult = ShimUtils.isAtLeastS()
+                ? NETWORK_VALIDATION_RESULT_VALID | NETWORK_VALIDATION_RESULT_SKIPPED
+                : NETWORK_VALIDATION_RESULT_VALID;
+        runNetworkTest(TEST_LINK_PROPERTIES, nc, validationResult,
+                0 /* probesSucceeded */, null /* redirectUrl */);
+        verify(mCleartextDnsNetwork, never()).openConnection(any());
+    }
+
     @Test
     public void testNoInternetCapabilityValidated() throws Exception {
-        runNetworkTest(TEST_LINK_PROPERTIES, CELL_NO_INTERNET_CAPABILITIES,
-                NETWORK_VALIDATION_RESULT_VALID, 0 /* probesSucceeded */, null /* redirectUrl */);
-        verify(mCleartextDnsNetwork, never()).openConnection(any());
+        doValidationSkippedTest(CELL_NO_INTERNET_CAPABILITIES);
+    }
+
+    @Test
+    public void testNoTrustedCapabilityValidated() throws Exception {
+        // Cannot use the NetworkCapabilities builder on Q
+        final NetworkCapabilities nc = new NetworkCapabilities()
+                .addCapability(NET_CAPABILITY_INTERNET)
+                .removeCapability(NET_CAPABILITY_TRUSTED)
+                .addTransportType(TRANSPORT_CELLULAR);
+        if (ShimUtils.isAtLeastS()) {
+            nc.addCapability(NET_CAPABILITY_NOT_VCN_MANAGED);
+        }
+        doValidationSkippedTest(nc);
+    }
+
+    @Test
+    public void testRestrictedCapabilityValidated() throws Exception {
+        // Cannot use the NetworkCapabilities builder on Q
+        final NetworkCapabilities nc = new NetworkCapabilities()
+                .addCapability(NET_CAPABILITY_INTERNET)
+                .removeCapability(NET_CAPABILITY_NOT_RESTRICTED)
+                .addTransportType(TRANSPORT_CELLULAR);
+        if (ShimUtils.isAtLeastS()) {
+            nc.addCapability(NET_CAPABILITY_NOT_VCN_MANAGED);
+        }
+        doValidationSkippedTest(nc);
     }
 
     private NetworkCapabilities getVcnUnderlyingCarrierWifiCaps() {
@@ -1805,7 +1842,7 @@ public class NetworkMonitorTest {
         // value up to Android R. Thus, this must be guarded by an SDK check in tests that use this.
         return new NetworkCapabilities.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .removeCapability(NetworkMonitorUtils.NET_CAPABILITY_NOT_VCN_MANAGED)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VCN_MANAGED)
                 .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
                 .removeCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED)
                 .addCapability(NET_CAPABILITY_INTERNET)
@@ -2720,8 +2757,12 @@ public class NetworkMonitorTest {
         final NetworkCapabilities networkCapabilities =
                 new NetworkCapabilities(WIFI_OEM_PAID_CAPABILITIES);
         networkCapabilities.removeCapability(NET_CAPABILITY_INTERNET);
+
+        final int validationResult = ShimUtils.isAtLeastS()
+                ? NETWORK_VALIDATION_RESULT_VALID | NETWORK_VALIDATION_RESULT_SKIPPED
+                : NETWORK_VALIDATION_RESULT_VALID;
         runNetworkTest(TEST_LINK_PROPERTIES, networkCapabilities,
-                NETWORK_VALIDATION_RESULT_VALID, 0 /* probesSucceeded */, null /* redirectUrl */);
+                validationResult, 0 /* probesSucceeded */, null /* redirectUrl */);
 
         verify(mCleartextDnsNetwork, never()).openConnection(any());
         verify(mHttpsConnection, never()).getResponseCode();

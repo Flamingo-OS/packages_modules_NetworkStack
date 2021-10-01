@@ -18,6 +18,9 @@ package android.net.ip;
 
 import static android.net.RouteInfo.RTN_UNICAST;
 import static android.net.dhcp.DhcpResultsParcelableUtil.toStableParcelable;
+import static android.net.ip.IIpClient.PROV_IPV4_DISABLED;
+import static android.net.ip.IIpClient.PROV_IPV6_DISABLED;
+import static android.net.ip.IIpClient.PROV_IPV6_LINKLOCAL;
 import static android.net.util.NetworkStackUtils.IPCLIENT_DISABLE_ACCEPT_RA_VERSION;
 import static android.net.util.NetworkStackUtils.IPCLIENT_GARP_NA_ROAMING_VERSION;
 import static android.net.util.NetworkStackUtils.IPCLIENT_GRATUITOUS_NA_VERSION;
@@ -61,6 +64,7 @@ import android.net.metrics.IpConnectivityLog;
 import android.net.metrics.IpManagerEvent;
 import android.net.networkstack.aidl.dhcp.DhcpOption;
 import android.net.shared.InitialConfiguration;
+import android.net.shared.Layer2Information;
 import android.net.shared.ProvisioningConfiguration;
 import android.net.shared.ProvisioningConfiguration.ScanResultInfo;
 import android.net.shared.ProvisioningConfiguration.ScanResultInfo.InformationElement;
@@ -69,6 +73,7 @@ import android.net.util.NetworkStackUtils;
 import android.net.util.SharedLog;
 import android.os.Build;
 import android.os.ConditionVariable;
+import android.os.Handler;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.RemoteException;
@@ -147,6 +152,7 @@ import java.util.stream.Collectors;
  * @hide
  */
 public class IpClient extends StateMachine {
+    private static final String TAG = IpClient.class.getSimpleName();
     private static final boolean DBG = false;
 
     // For message logging.
@@ -394,6 +400,24 @@ public class IpClient extends StateMachine {
                 log("Failed to call onPreconnectionStart", e);
             }
         }
+
+        /**
+         * Get the version of the IIpClientCallbacks AIDL interface.
+         */
+        public int getInterfaceVersion() {
+            log("getInterfaceVersion");
+            try {
+                return mCallback.getInterfaceVersion();
+            } catch (RemoteException e) {
+                // This can never happen for callers in the system server, because if the
+                // system server crashes, then the networkstack will crash as well. But it can
+                // happen for other callers such as bluetooth or telephony (if it starts to use
+                // IpClient). 0 will generally work but will assume an old client and disable
+                // all new features.
+                log("Failed to call getInterfaceVersion", e);
+                return 0;
+            }
+        }
     }
 
     public static final String DUMP_ARG_CONFIRM = "confirm";
@@ -594,8 +618,30 @@ public class IpClient extends StateMachine {
             return new IpConnectivityLog();
         }
 
+        /**
+         * Get a NetworkQuirkMetrics instance.
+         */
         public NetworkQuirkMetrics getNetworkQuirkMetrics() {
             return new NetworkQuirkMetrics();
+        }
+
+        /**
+         * Get a IpReachabilityMonitor instance.
+         */
+        public IpReachabilityMonitor getIpReachabilityMonitor(Context context,
+                InterfaceParams ifParams, Handler h, SharedLog log,
+                IpReachabilityMonitor.Callback callback, boolean usingMultinetworkPolicyTracker,
+                IpReachabilityMonitor.Dependencies deps, final INetd netd) {
+            return new IpReachabilityMonitor(context, ifParams, h, log, callback,
+                    usingMultinetworkPolicyTracker, deps, netd);
+        }
+
+        /**
+         * Get a IpReachabilityMonitor dependencies instance.
+         */
+        public IpReachabilityMonitor.Dependencies getIpReachabilityMonitorDeps(Context context,
+                String name) {
+            return IpReachabilityMonitor.Dependencies.makeDefault(context, name);
         }
 
         /**
@@ -770,7 +816,8 @@ public class IpClient extends StateMachine {
         @Override
         public void startProvisioning(ProvisioningConfigurationParcelable req) {
             enforceNetworkStackCallingPermission();
-            IpClient.this.startProvisioning(ProvisioningConfiguration.fromStableParcelable(req));
+            IpClient.this.startProvisioning(ProvisioningConfiguration.fromStableParcelable(req,
+                    mCallback.getInterfaceVersion()));
         }
         @Override
         public void stop() {
@@ -872,26 +919,28 @@ public class IpClient extends StateMachine {
                 false /* defaultEnabled */);
     }
 
-    private void setInitialBssid(final ProvisioningConfiguration req) {
-        final ScanResultInfo scanResultInfo = req.mScanResultInfo;
-        mCurrentBssid = null;
+    @VisibleForTesting
+    static MacAddress getInitialBssid(final Layer2Information layer2Info,
+            final ScanResultInfo scanResultInfo, boolean isAtLeastS) {
+        MacAddress bssid = null;
         // http://b/185202634
         // ScanResultInfo is not populated in some situations.
         // On S and above, prefer getting the BSSID from the Layer2Info.
         // On R and below, get the BSSID from the ScanResultInfo and fall back to
         // getting it from the Layer2Info. This ensures no regressions if any R
         // devices pass in a null or meaningless BSSID in the Layer2Info.
-        if (!ShimUtils.isAtLeastS() && scanResultInfo != null) {
+        if (!isAtLeastS && scanResultInfo != null) {
             try {
-                mCurrentBssid = MacAddress.fromString(scanResultInfo.getBssid());
+                bssid = MacAddress.fromString(scanResultInfo.getBssid());
             } catch (IllegalArgumentException e) {
-                Log.wtf(mTag, "Invalid BSSID: " + scanResultInfo.getBssid()
+                Log.wtf(TAG, "Invalid BSSID: " + scanResultInfo.getBssid()
                         + " in provisioning configuration", e);
             }
         }
-        if (mCurrentBssid == null && req.mLayer2Info != null) {
-            mCurrentBssid = req.mLayer2Info.mBssid;
+        if (bssid == null && layer2Info != null) {
+            bssid = layer2Info.mBssid;
         }
+        return bssid;
     }
 
     private boolean shouldDisableAcceptRaOnProvisioningLoss() {
@@ -922,7 +971,8 @@ public class IpClient extends StateMachine {
             return;
         }
 
-        setInitialBssid(req);
+        mCurrentBssid = getInitialBssid(req.mLayer2Info, req.mScanResultInfo,
+                ShimUtils.isAtLeastS());
         if (req.mLayer2Info != null) {
             mL2Key = req.mLayer2Info.mL2Key;
             mCluster = req.mLayer2Info.mCluster;
@@ -1199,12 +1249,41 @@ public class IpClient extends StateMachine {
         transitionTo(mStoppingState);
     }
 
+    private static boolean hasIpv6LinkLocalInterfaceRoute(final LinkProperties lp) {
+        for (RouteInfo r : lp.getRoutes()) {
+            if (r.getDestination().equals(new IpPrefix("fe80::/64"))
+                    && r.getGateway().isAnyLocalAddress()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasIpv6LinkLocalAddress(final LinkProperties lp) {
+        for (LinkAddress address : lp.getLinkAddresses()) {
+            if (address.isIpv6() && address.getAddress().isLinkLocalAddress()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // LinkProperties has a link-local (fe80::xxx) IPv6 address and route to fe80::/64 destination.
+    private boolean isIpv6LinkLocalProvisioned(final LinkProperties lp) {
+        if (mConfiguration == null
+                || mConfiguration.mIPv6ProvisioningMode != PROV_IPV6_LINKLOCAL) return false;
+        if (hasIpv6LinkLocalAddress(lp) && hasIpv6LinkLocalInterfaceRoute(lp)) return true;
+        return false;
+    }
+
     // For now: use WifiStateMachine's historical notion of provisioned.
     @VisibleForTesting
-    static boolean isProvisioned(LinkProperties lp, InitialConfiguration config) {
-        // For historical reasons, we should connect even if all we have is
-        // an IPv4 address and nothing else.
-        if (lp.hasIpv4Address() || lp.isProvisioned()) {
+    boolean isProvisioned(final LinkProperties lp, final InitialConfiguration config) {
+        // For historical reasons, we should connect even if all we have is an IPv4
+        // address and nothing else. If IPv6 link-local only mode is enabled and
+        // it's provisioned without IPv4, then still connecting once IPv6 link-local
+        // address is ready to use and route to fe80::/64 destination is up.
+        if (lp.hasIpv4Address() || lp.isProvisioned() || isIpv6LinkLocalProvisioned(lp)) {
             return true;
         }
         if (config == null) {
@@ -1771,7 +1850,7 @@ public class IpClient extends StateMachine {
 
     private boolean startIpReachabilityMonitor() {
         try {
-            mIpReachabilityMonitor = new IpReachabilityMonitor(
+            mIpReachabilityMonitor = mDependencies.getIpReachabilityMonitor(
                     mContext,
                     mInterfaceParams,
                     getHandler(),
@@ -1783,6 +1862,7 @@ public class IpClient extends StateMachine {
                         }
                     },
                     mConfiguration.mUsingMultinetworkPolicyTracker,
+                    mDependencies.getIpReachabilityMonitorDeps(mContext, mInterfaceParams.name),
                     mNetd);
         } catch (IllegalArgumentException iae) {
             // Failed to start IpReachabilityMonitor. Log it and call
@@ -2200,6 +2280,14 @@ public class IpClient extends StateMachine {
         }
     }
 
+    private boolean isIpv6Enabled() {
+        return mConfiguration.mIPv6ProvisioningMode != PROV_IPV6_DISABLED;
+    }
+
+    private boolean isIpv4Enabled() {
+        return mConfiguration.mIPv4ProvisioningMode != PROV_IPV4_DISABLED;
+    }
+
     class RunningState extends State {
         private ConnectivityPacketTracker mPacketTracker;
         private boolean mDhcpActionInFlight;
@@ -2232,13 +2320,13 @@ public class IpClient extends StateMachine {
             mPacketTracker = createPacketTracker();
             if (mPacketTracker != null) mPacketTracker.start(mConfiguration.mDisplayName);
 
-            if (mConfiguration.mEnableIPv6 && !startIPv6()) {
+            if (isIpv6Enabled() && !startIPv6()) {
                 doImmediateProvisioningFailure(IpManagerEvent.ERROR_STARTING_IPV6);
                 enqueueJumpToStoppingState(DisconnectCode.DC_ERROR_STARTING_IPV6);
                 return;
             }
 
-            if (mConfiguration.mEnableIPv4 && !isUsingPreconnection() && !startIPv4()) {
+            if (isIpv4Enabled() && !isUsingPreconnection() && !startIPv4()) {
                 doImmediateProvisioningFailure(IpManagerEvent.ERROR_STARTING_IPV4);
                 enqueueJumpToStoppingState(DisconnectCode.DC_ERROR_STARTING_IPV4);
                 return;
