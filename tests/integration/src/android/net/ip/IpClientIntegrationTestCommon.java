@@ -146,7 +146,6 @@ import android.system.Os;
 import androidx.annotation.NonNull;
 import androidx.test.InstrumentationRegistry;
 import androidx.test.filters.SmallTest;
-import androidx.test.runner.AndroidJUnit4;
 
 import com.android.internal.util.HexDump;
 import com.android.internal.util.StateMachine;
@@ -161,6 +160,7 @@ import com.android.networkstack.apishim.ConstantsShim;
 import com.android.networkstack.apishim.common.ShimUtils;
 import com.android.networkstack.arp.ArpPacket;
 import com.android.networkstack.metrics.IpProvisioningMetrics;
+import com.android.networkstack.metrics.IpReachabilityMonitorMetrics;
 import com.android.networkstack.metrics.NetworkQuirkMetrics;
 import com.android.networkstack.packets.NeighborAdvertisement;
 import com.android.networkstack.packets.NeighborSolicitation;
@@ -180,6 +180,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TestName;
 import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -223,7 +224,7 @@ import kotlin.LazyKt;
  *
  * Tests in this class can either be run with signature permissions, or with root access.
  */
-@RunWith(AndroidJUnit4.class)
+@RunWith(Parameterized.class)
 @SmallTest
 public abstract class IpClientIntegrationTestCommon {
     private static final int DATA_BUFFER_LEN = 4096;
@@ -245,6 +246,17 @@ public abstract class IpClientIntegrationTestCommon {
     public final DevSdkIgnoreRule mIgnoreRule = new DevSdkIgnoreRule();
     @Rule
     public final TestName mTestNameRule = new TestName();
+
+    // Indicate whether the flag of parsing netlink event is enabled or not. If it's disabled,
+    // integration test still covers the old codepath(i.e. using NetworkObserver), otherwise,
+    // test goes through the new codepath(i.e. processRtNetlinkxxx).
+    @Parameterized.Parameter(0)
+    public boolean mIsNetlinkEventParseEnabled;
+
+    @Parameterized.Parameters
+    public static Iterable<? extends Object> data() {
+        return Arrays.asList(Boolean.valueOf("false"), Boolean.valueOf("true"));
+    }
 
     /**
      * Indicates that a test requires signature permissions to run.
@@ -277,6 +289,7 @@ public abstract class IpClientIntegrationTestCommon {
     @Mock private PowerManager.WakeLock mTimeoutWakeLock;
     @Mock protected NetworkStackIpMemoryStore mIpMemoryStore;
     @Mock private NetworkQuirkMetrics.Dependencies mNetworkQuirkMetricsDeps;
+    @Mock private IpReachabilityMonitorMetrics mIpReachabilityMonitorMetrics;
     @Mock protected IpReachabilityMonitor.Callback mCallback;
 
     @Spy private INetd mNetd;
@@ -485,6 +498,10 @@ public abstract class IpClientIntegrationTestCommon {
                         boolean defaultEnabled) {
                     return Dependencies.this.isFeatureEnabled(context, name, defaultEnabled);
                 }
+
+                public IpReachabilityMonitorMetrics getIpReachabilityMonitorMetrics() {
+                    return mIpReachabilityMonitorMetrics;
+                }
             };
         }
 
@@ -547,8 +564,14 @@ public abstract class IpClientIntegrationTestCommon {
 
     @Before
     public void setUp() throws Exception {
-        final Method testMethod = IpClientIntegrationTestCommon.class.getMethod(
-                mTestNameRule.getMethodName());
+        // Suffix "[0]" or "[1]" is added to the end of test method name after running with
+        // Parameterized.class, that's intended behavior, to iterate each test method with the
+        // parameterize value. However, Class#getMethod() throws NoSuchMethodException when
+        // searching the target test method name due to this change. Just keep the original test
+        // method name to fix NoSuchMethodException, and find the correct annotation associated
+        // to test method.
+        final String testMethodName = mTestNameRule.getMethodName().split("\\[")[0];
+        final Method testMethod = IpClientIntegrationTestCommon.class.getMethod(testMethodName);
         mIsSignatureRequiredTest = testMethod.getAnnotation(SignatureRequiredTest.class) != null;
         assumeFalse(testSkipped());
 
@@ -561,6 +584,12 @@ public abstract class IpClientIntegrationTestCommon {
         }
 
         mIIpClient = makeIIpClient(mIfaceName, mCb);
+
+        // Depend on the parameterized value to enable/disable netlink message refactor flag.
+        // Make sure both of the old codepath(rely on the INetdUnsolicitedEventListener aidl)
+        // and new codepath(parse netlink event from kernel) will be executed.
+        setFeatureEnabled(NetworkStackUtils.IPCLIENT_PARSE_NETLINK_EVENTS_VERSION,
+                mIsNetlinkEventParseEnabled /* default value */);
     }
 
     protected void setUpMocks() throws Exception {
