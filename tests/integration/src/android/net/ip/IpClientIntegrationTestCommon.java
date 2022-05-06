@@ -59,6 +59,7 @@ import static com.android.net.module.util.NetworkStackConstants.NEIGHBOR_ADVERTI
 import static com.android.net.module.util.NetworkStackConstants.PIO_FLAG_AUTONOMOUS;
 import static com.android.net.module.util.NetworkStackConstants.PIO_FLAG_ON_LINK;
 import static com.android.testutils.MiscAsserts.assertThrows;
+import static com.android.testutils.ParcelUtils.parcelingRoundTrip;
 import static com.android.testutils.TestPermissionUtil.runAsShell;
 
 import static junit.framework.Assert.fail;
@@ -358,6 +359,9 @@ public abstract class IpClientIntegrationTestCommon {
     private static final Inet4Address NETMASK = getPrefixMaskAsInet4Address(PREFIX_LENGTH);
     private static final Inet4Address BROADCAST_ADDR = getBroadcastAddress(
             SERVER_ADDR, PREFIX_LENGTH);
+    private static final String IPV6_LINK_LOCAL_PREFIX = "fe80::/64";
+    private static final String IPV4_TEST_SUBNET_PREFIX = "192.168.1.0/24";
+    private static final String IPV4_ANY_ADDRESS_PREFIX = "0.0.0.0/0";
     private static final String HOSTNAME = "testhostname";
     private static final int TEST_DEFAULT_MTU = 1500;
     private static final int TEST_MIN_MTU = 1280;
@@ -2317,7 +2321,7 @@ public abstract class IpClientIntegrationTestCommon {
         assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
     }
 
-    private void runDhcpClientCaptivePortalApiTest(boolean featureEnabled,
+    private LinkProperties runDhcpClientCaptivePortalApiTest(boolean featureEnabled,
             boolean serverSendsOption) throws Exception {
         startIpClientProvisioning(false /* isDhcpLeaseCacheEnabled */,
                 false /* shouldReplyRapidCommitAck */, false /* isPreConnectionEnabled */,
@@ -2344,10 +2348,12 @@ public abstract class IpClientIntegrationTestCommon {
 
         // Ensure that the URL was set as expected in the callbacks.
         // Can't verify the URL up to Q as there is no such attribute in LinkProperties.
-        if (!ShimUtils.isAtLeastR()) return;
+        if (!ShimUtils.isAtLeastR()) return null;
         verify(mCb, atLeastOnce()).onLinkPropertiesChange(captor.capture());
-        assertTrue(captor.getAllValues().stream().anyMatch(
-                lp -> Objects.equals(expectedUrl, lp.getCaptivePortalApiUrl())));
+        final LinkProperties expectedLp = captor.getAllValues().stream().findFirst().get();
+        assertNotNull(expectedLp);
+        assertEquals(expectedUrl, expectedLp.getCaptivePortalApiUrl());
+        return expectedLp;
     }
 
     @Test
@@ -2362,6 +2368,30 @@ public abstract class IpClientIntegrationTestCommon {
         // Only run the test on platforms / builds where the API is enabled
         assumeTrue(CaptivePortalDataShimImpl.isSupported());
         runDhcpClientCaptivePortalApiTest(true /* featureEnabled */, false /* serverSendsOption */);
+    }
+
+    @Test
+    public void testDhcpClientCaptivePortalApiEnabled_ParcelSensitiveFields() throws Exception {
+        // Only run the test on platforms / builds where the API is enabled
+        assumeTrue(CaptivePortalDataShimImpl.isSupported());
+        LinkProperties lp = runDhcpClientCaptivePortalApiTest(true /* featureEnabled */,
+                true /* serverSendsOption */);
+
+        // Integration test process runs in the same process with network stack module, there
+        // won't be any IPC call happened on IpClientCallbacks, manually run parcelingRoundTrip
+        // to parcel and unparcel the LinkProperties to simulate what happens during the binder
+        // call. In this case lp should contain the senstive data but mParcelSensitiveFields is
+        // false after round trip.
+        if (useNetworkStackSignature()) {
+            lp = parcelingRoundTrip(lp);
+        }
+        final Uri expectedUrl = Uri.parse(TEST_CAPTIVE_PORTAL_URL);
+        assertEquals(expectedUrl, lp.getCaptivePortalApiUrl());
+
+        // Parcel and unparcel the captured LinkProperties, mParcelSensitiveFields is false,
+        // CaptivePortalApiUrl should be null after parceling round trip.
+        final LinkProperties unparceled = parcelingRoundTrip(lp);
+        assertNull(unparceled.getCaptivePortalApiUrl());
     }
 
     @Test
@@ -2692,6 +2722,13 @@ public abstract class IpClientIntegrationTestCommon {
                 (long) NetworkQuirkEvent.QE_IPV6_PROVISIONING_ROUTER_LOST.ordinal());
     }
 
+    private boolean hasRouteTo(@NonNull final LinkProperties lp, @NonNull final String prefix) {
+        for (RouteInfo r : lp.getRoutes()) {
+            if (r.getDestination().equals(new IpPrefix(prefix))) return true;
+        }
+        return false;
+    }
+
     @Test @SignatureRequiredTest(reason = "signature perms are required due to mocked callabck")
     public void testIgnoreIpv6ProvisioningLoss_disableAcceptRa() throws Exception {
         doDualStackProvisioning(true /* shouldDisableAcceptRa */);
@@ -2707,6 +2744,8 @@ public abstract class IpClientIntegrationTestCommon {
                     // Only IPv4 provisioned and IPv6 link-local address
                     final boolean isIPv6LinkLocalAndIPv4OnlyProvisioned =
                             (x.getLinkAddresses().size() == 2
+                                    // fe80::/64, IPv4 default route, IPv4 subnet route
+                                    && x.getRoutes().size() == 3
                                     && x.getDnsServers().size() == 1
                                     && x.getAddresses().get(0) instanceof Inet4Address
                                     && x.getDnsServers().get(0) instanceof Inet4Address);
@@ -2719,6 +2758,10 @@ public abstract class IpClientIntegrationTestCommon {
         assertNotNull(lp);
         assertEquals(lp.getAddresses().get(0), CLIENT_ADDR);
         assertEquals(lp.getDnsServers().get(0), SERVER_ADDR);
+        assertEquals(3, lp.getRoutes().size());
+        assertTrue(hasRouteTo(lp, IPV6_LINK_LOCAL_PREFIX)); // fe80::/64
+        assertTrue(hasRouteTo(lp, IPV4_TEST_SUBNET_PREFIX)); // IPv4 directly-connected route
+        assertTrue(hasRouteTo(lp, IPV4_ANY_ADDRESS_PREFIX)); // IPv4 default route
         assertTrue(lp.getAddresses().get(1).isLinkLocalAddress());
 
         reset(mCb);
